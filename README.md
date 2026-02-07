@@ -37,6 +37,9 @@ python papercore.py ./papers/ -v
 
 # Disable compression (treat everything as Zone B)
 python papercore.py ./papers/ --no-compress
+
+# Keep full reference list (default: compressed to count)
+python papercore.py ./papers/ --keep-refs
 ```
 
 ## Output Format
@@ -132,6 +135,9 @@ python papercore.py ./papers/ -v
 
 # 禁用压缩（所有章节均全量保留）
 python papercore.py ./papers/ --no-compress
+
+# 保留完整参考文献列表（默认压缩为数量统计）
+python papercore.py ./papers/ --keep-refs
 ```
 
 ## 图形界面

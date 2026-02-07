@@ -35,6 +35,7 @@ class Zone(Enum):
     A = "metadata"
     B = "full_retention"
     C = "compression"
+    SKIP = "skip"  # boilerplate sections to omit
     UNKNOWN = "unknown"  # treated as Zone B (safe default)
 
 
@@ -123,6 +124,66 @@ ZONE_C_PATTERNS: dict[str, list[str]] = {
     ],
 }
 
+# Sections to detect as references (compress to count by default)
+_REFERENCES_HEADERS: set[str] = {
+    "references", "reference", "bibliography", "works cited",
+    "literature cited", "literature", "citations",
+}
+
+# Boilerplate sections to skip entirely
+_BOILERPLATE_HEADERS: set[str] = {
+    "conflict of interest", "conflict of interest statement",
+    "conflicts of interest", "competing interests",
+    "disclosure statement", "disclosure", "disclosures",
+    "acknowledgments", "acknowledgements", "acknowledgment", "acknowledgement",
+    "funding", "funding sources", "funding statement",
+    "data availability", "data availability statement",
+    "code availability", "data access",
+    "author contributions", "author contribution", "contributions",
+    "ethics statement", "ethical approval", "ethics approval",
+    "informed consent", "consent to participate",
+    "supplementary material", "supplementary materials",
+    "supplementary information", "supporting information",
+    "appendix", "appendices",
+    "abbreviations", "list of abbreviations",
+    "declarations",
+}
+
+# Patterns that indicate a header is NOT a paper title
+_NON_TITLE_PATTERNS: set[str] = {
+    # Article type labels
+    "review", "research article", "original article", "brief communication",
+    "letter", "commentary", "editorial", "perspective", "opinion",
+    "short communication", "case report", "meta-analysis", "systematic review",
+    "mini review", "rapid communication", "correspondence", "erratum",
+    "retraction", "addendum", "corrigendum", "book review",
+    # Journal name prefixes
+    "annual review", "journal of", "proceedings of", "transactions on",
+    "letters in", "advances in", "frontiers in", "current opinion",
+    "trends in", "nature", "science", "plos one", "plos",
+    "sciencedirect",
+}
+
+# Negative patterns for author extraction
+_AUTHOR_REJECT_PATTERNS: list[str] = [
+    r"\bpublished\b",
+    r"\breceived\b",
+    r"\baccepted\b",
+    r"\bavailable online\b",
+    r"\bdoi\b",
+    r"\bhttps?://",
+    r"\b10\.\d{4,}/",
+    r"©|copyright|\bcopyright\b",
+    r"\bvol\b\.?\s*\d",
+    r"\bpp?\.\s*\d",
+    r"\bissn\b",
+    r"\belsevier\b|\bspringer\b|\bwiley\b|\bacademic press\b",
+    r"\bthis (article|review|paper)\b",
+    r"\bedited by\b",
+    r"\brefer\b",
+    r"^\d+\s*(department|school|university|institute)",
+]
+
 
 # ---------------------------------------------------------------------------
 # SectionClassifier
@@ -162,12 +223,28 @@ class SectionClassifier:
         text = re.sub(r"[:.]\s*$", "", text)
         return text.strip()
 
+    @staticmethod
+    def _word_boundary_match(pattern: str, text: str) -> bool:
+        """Check if pattern appears as whole word(s) in text or vice versa.
+
+        Skips containment for very short patterns (<=4 chars) to avoid
+        false positives like "data" matching inside unrelated headers.
+        """
+        if len(pattern) <= 4 or len(text) <= 4:
+            return False
+        if re.search(r"\b" + re.escape(pattern) + r"\b", text):
+            return True
+        if re.search(r"\b" + re.escape(text) + r"\b", pattern):
+            return True
+        return False
+
     def classify(self, header_text: str) -> Zone:
         """Classify a section header into a zone.
 
         Strategy (in order):
+          0. Check boilerplate sections -> Zone.SKIP
           1. Exact match against normalized synonym sets
-          2. Containment match (pattern in header or header in pattern)
+          2. Word-boundary containment match
           3. Default to UNKNOWN (treated as Zone B)
 
         Zone B is checked before Zone C so that ambiguous headers like
@@ -175,18 +252,22 @@ class SectionClassifier:
         """
         normalized = self._normalize(header_text)
 
+        # Tier 0: boilerplate sections
+        if normalized in _BOILERPLATE_HEADERS:
+            return Zone.SKIP
+
         # Tier 1: exact match
         if normalized in self._zone_b_set:
             return Zone.B
         if normalized in self._zone_c_set:
             return Zone.C
 
-        # Tier 2: containment (Zone B checked first for safety)
+        # Tier 2: word-boundary containment (Zone B checked first)
         for pattern in self._zone_b_set:
-            if pattern in normalized or normalized in pattern:
+            if self._word_boundary_match(pattern, normalized):
                 return Zone.B
         for pattern in self._zone_c_set:
-            if pattern in normalized or normalized in pattern:
+            if self._word_boundary_match(pattern, normalized):
                 return Zone.C
 
         return Zone.UNKNOWN
@@ -207,26 +288,34 @@ class PaperMetadata:
 class MetadataExtractor:
     """Extracts title, authors, and year from the document preamble."""
 
+    # Non-content headers that appear before the real body
+    _SKIP_HEADERS: set[str] = {
+        "key words", "keywords", "key-words", "keyword",
+        "addresses", "address", "affiliations", "affiliation",
+        "author affiliations", "author information",
+        "correspondence", "corresponding author",
+        "doi", "article info", "article information",
+        "publication info", "publication information",
+        "graphical abstract", "highlights",
+        "abbreviations", "nomenclature", "notation",
+        "sciencedirect",
+    }
+
     @staticmethod
     def extract(doc, items_iterator) -> tuple[PaperMetadata, list]:
         """Consume leading items up to the first content SECTION_HEADER.
 
-        The first section_header is treated as the title if no TITLE label
-        exists (common in academic PDFs where docling misclassifies the
-        paper title as a section header).
+        Collects title candidates from preamble headers, filters out
+        journal names and article-type labels, and picks the best title.
 
         Returns (metadata, remaining_items).
         """
         metadata = PaperMetadata()
         remaining: list = []
-        found_title = False
+        found_title = False  # True when TITLE label is found
         found_content_section = False
         preamble_texts: list[str] = []
-
-        # Non-content headers that appear before the real body
-        _skip_headers = {
-            "key words", "keywords", "key-words",
-        }
+        title_candidates: list[str] = []
 
         for item, level in items_iterator:
             label = getattr(item, "label", None)
@@ -240,19 +329,47 @@ class MetadataExtractor:
                 found_title = True
 
             elif label == DocItemLabel.SECTION_HEADER:
-                header_lower = item.text.strip().lower()
+                header_text = item.text.strip()
+                header_lower = header_text.lower()
 
-                # First section_header -> use as title if none found yet
+                # Skip non-content preamble headers
+                if header_lower in MetadataExtractor._SKIP_HEADERS or any(
+                    header_lower.startswith(s)
+                    for s in MetadataExtractor._SKIP_HEADERS
+                ):
+                    continue
+
                 if not found_title:
-                    metadata.title = item.text.strip()
-                    found_title = True
+                    # "Abstract" reached before any TITLE label
+                    if "abstract" in header_lower:
+                        metadata.title = (
+                            MetadataExtractor._pick_best_title(
+                                title_candidates, preamble_texts
+                            )
+                        )
+                        found_title = True
+                        found_content_section = True
+                        remaining.append((item, level))
+                        continue
+
+                    # Collect as title candidate
+                    title_candidates.append(header_text)
+
+                    # After 3 candidates, pick and move on
+                    if len(title_candidates) >= 3:
+                        metadata.title = (
+                            MetadataExtractor._pick_best_title(
+                                title_candidates, preamble_texts
+                            )
+                        )
+                        found_title = True
+                        found_content_section = True
+                        remaining.append((item, level))
+                        continue
+
                     continue
 
-                # Skip non-content headers in the preamble
-                if header_lower in _skip_headers:
-                    continue
-
-                # "Abstract" header: mark as start of content
+                # Already have a title — check for content start
                 if "abstract" in header_lower:
                     found_content_section = True
                     remaining.append((item, level))
@@ -265,10 +382,54 @@ class MetadataExtractor:
             elif label in (DocItemLabel.TEXT, DocItemLabel.PARAGRAPH):
                 preamble_texts.append(item.text.strip())
 
+        # Resolve title if never hit abstract/content header
+        if not found_title and title_candidates:
+            metadata.title = MetadataExtractor._pick_best_title(
+                title_candidates, preamble_texts
+            )
+
         metadata.authors = MetadataExtractor._extract_authors(preamble_texts)
         metadata.year = MetadataExtractor._extract_year(preamble_texts)
 
         return metadata, remaining
+
+    @staticmethod
+    def _is_likely_title(text: str) -> bool:
+        """Return False if text looks like an article-type label or journal name."""
+        lower = text.strip().lower()
+        if lower in _NON_TITLE_PATTERNS:
+            return False
+        for pattern in _NON_TITLE_PATTERNS:
+            if lower.startswith(pattern):
+                return False
+        # Single word, short — unlikely to be a paper title
+        if len(lower) <= 15 and " " not in lower:
+            return False
+        return True
+
+    @staticmethod
+    def _pick_best_title(
+        candidates: list[str], preamble_texts: list[str] | None = None
+    ) -> str:
+        """Pick the best title from candidates, filtering non-titles.
+
+        Falls back to scanning preamble texts for a title-like string.
+        """
+        for c in candidates:
+            if MetadataExtractor._is_likely_title(c):
+                return c
+        # Fallback: look for a title-like string in preamble texts
+        if preamble_texts:
+            for text in preamble_texts:
+                text = text.strip()
+                if (
+                    20 <= len(text) <= 250
+                    and not text.endswith(".")
+                    and ". " not in text[:80]
+                ):
+                    return text
+        # Last resort: longest candidate
+        return max(candidates, key=len) if candidates else ""
 
     @staticmethod
     def _extract_year(texts: list[str]) -> str:
@@ -280,13 +441,48 @@ class MetadataExtractor:
 
     @staticmethod
     def _extract_authors(texts: list[str]) -> str:
+        """Extract author names from preamble texts.
+
+        Rejects texts matching negative patterns (dates, DOIs, copyright),
+        then scores candidates by author-like features.
+        """
+        candidates = []
         for text in texts:
-            # Skip full sentences (likely abstract or body text)
-            if ". " in text and len(text) > 150:
+            text_stripped = text.strip()
+            if not text_stripped or len(text_stripped) > 500:
                 continue
-            if len(text) < 500 and ("," in text or " and " in text.lower()):
-                return text
-        return texts[0] if texts else ""
+            # Skip full sentences (likely abstract)
+            if ". " in text_stripped and len(text_stripped) > 150:
+                continue
+            # Apply negative filters
+            lower = text_stripped.lower()
+            rejected = False
+            for pattern in _AUTHOR_REJECT_PATTERNS:
+                if re.search(pattern, lower):
+                    rejected = True
+                    break
+            if rejected:
+                continue
+            candidates.append(text_stripped)
+
+        if not candidates:
+            return ""
+
+        def _author_score(text: str) -> int:
+            score = 0
+            if re.search(r"[A-Z][a-z]+ and [A-Z][a-z]+", text):
+                score += 3
+            if re.search(r"[\d*†‡§]", text):
+                score += 1
+            caps = re.findall(r"\b[A-Z][a-z]+\b", text)
+            if len(caps) >= 2:
+                score += 2
+            if len(text) > 200:
+                score -= 1
+            return score
+
+        candidates.sort(key=_author_score, reverse=True)
+        return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +507,8 @@ class ZoneRenderer:
         if label is None or isinstance(label, GroupLabel):
             return None
 
+        if zone == Zone.SKIP:
+            return None
         if zone in (Zone.B, Zone.UNKNOWN):
             return self._render_full(item, label)
         if zone == Zone.C:
@@ -477,7 +675,8 @@ class ZoneRenderer:
 class PaperConverter:
     """Converts academic PDFs to three-zone compressed Markdown."""
 
-    def __init__(self):
+    def __init__(self, keep_refs: bool = False):
+        self._keep_refs = keep_refs
         pipeline_opts = PdfPipelineOptions(
             do_table_structure=True,
             do_ocr=False,
@@ -554,16 +753,55 @@ class PaperConverter:
         parts: list[str] = [self._render_metadata(metadata)]
 
         current_zone = Zone.B  # default before any header
+        in_references = False
+        ref_count = 0
+
         for item, level in remaining:
             label = getattr(item, "label", None)
 
             if label == DocItemLabel.SECTION_HEADER:
-                current_zone = self._classifier.classify(item.text)
-                logger.debug(f"  [{current_zone.name}] {item.text}")
+                header_normalized = SectionClassifier._normalize(item.text)
+
+                # Detect references section
+                if header_normalized in _REFERENCES_HEADERS:
+                    if self._keep_refs:
+                        current_zone = Zone.UNKNOWN
+                    else:
+                        in_references = True
+                        ref_count = 0
+                        continue
+                else:
+                    # New non-reference section ends reference mode
+                    if in_references and ref_count > 0:
+                        parts.append(f"*[{ref_count} references omitted]*")
+                        in_references = False
+                        ref_count = 0
+
+                    current_zone = self._classifier.classify(item.text)
+                    logger.debug(f"  [{current_zone.name}] {item.text}")
+
+            # Count references instead of rendering
+            if in_references:
+                if label in (
+                    DocItemLabel.REFERENCE,
+                    DocItemLabel.TEXT,
+                    DocItemLabel.PARAGRAPH,
+                    DocItemLabel.LIST_ITEM,
+                ):
+                    ref_count += 1
+                continue
+
+            # Skip boilerplate sections
+            if current_zone == Zone.SKIP:
+                continue
 
             rendered = renderer.render_item(item, level, current_zone)
             if rendered is not None:
                 parts.append(rendered)
+
+        # Flush trailing references
+        if in_references and ref_count > 0:
+            parts.append(f"*[{ref_count} references omitted]*")
 
         return "\n\n".join(p for p in parts if p)
 
@@ -690,6 +928,11 @@ Examples:
         help="Disable Zone C compression (treat all sections as Zone B)",
     )
     parser.add_argument(
+        "--keep-refs",
+        action="store_true",
+        help="Keep full reference list (default: compress to count)",
+    )
+    parser.add_argument(
         "--gui",
         action="store_true",
         help="Launch the graphical interface",
@@ -716,7 +959,7 @@ Examples:
     input_path = Path(args.input)
     output_path = Path(args.output) if args.output else None
 
-    converter = PaperConverter()
+    converter = PaperConverter(keep_refs=args.keep_refs)
 
     if args.no_compress:
         converter._classifier = SectionClassifier(zone_c_patterns={})
