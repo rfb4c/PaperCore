@@ -804,6 +804,13 @@ class PaperConverter:
                     current_zone = self._classifier.classify(item.text)
                     logger.debug(f"  [{current_zone.name}] {item.text}")
 
+                    # Insert separator before main sections (## level)
+                    if (
+                        current_zone != Zone.SKIP
+                        and ZoneRenderer._heading_level(item) <= 2
+                    ):
+                        parts.append("---")
+
             # Count references instead of rendering
             if in_references:
                 if label in (
