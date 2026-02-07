@@ -212,9 +212,11 @@ class SectionClassifier:
     def _normalize(text: str) -> str:
         """Normalize header text: strip numbering, lowercase, trim."""
         text = text.strip().lower()
-        # Remove leading section numbers: "3.", "3.1.", "III.", "A.", "1)"
+        # Remove leading section numbers: "3.", "3.1.", "III.", "a)", "A."
+        # Delimiters (. or )) are REQUIRED for letter prefixes to avoid
+        # stripping the first character of content words.
         text = re.sub(
-            r"^(?:\d+\.?\d*\.?\s*|[ivxlc]+\.?\s*|[a-z]\)?\s*)",
+            r"^(?:\d+\.?\d*\.?\s*|[a-z]{1,4}[\.\)]\s*)",
             "",
             text,
             flags=re.IGNORECASE,
@@ -422,10 +424,15 @@ class MetadataExtractor:
         if preamble_texts:
             for text in preamble_texts:
                 text = text.strip()
+                lower = text.lower()
                 if (
                     20 <= len(text) <= 250
                     and not text.endswith(".")
                     and ". " not in text[:80]
+                    and not re.search(
+                        r"\b(published|received|accepted|"
+                        r"copyright|©|doi|https?://)\b", lower
+                    )
                 ):
                     return text
         # Last resort: longest candidate
