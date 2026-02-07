@@ -184,11 +184,13 @@ _AUTHOR_REJECT_PATTERNS: list[str] = [
     r"©|copyright|\bcopyright\b",
     r"\bvol\b\.?\s*\d",
     r"\bpp?\.\s*\d",
+    r"\d+\s*:\s*\d+[-–]\d+",  # volume:page-page (e.g. "22:129-46")
     r"\bissn\b",
     r"\belsevier\b|\bspringer\b|\bwiley\b|\bacademic press\b",
     r"\bthis (article|review|paper)\b",
     r"\bedited by\b",
     r"\brefer\b",
+    r"\bannu\.?\s*rev\b",  # journal abbreviation "Annu. Rev."
     r"^\d+\s*(department|school|university|institute)",
 ]
 
