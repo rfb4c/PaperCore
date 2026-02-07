@@ -147,6 +147,14 @@ _BOILERPLATE_HEADERS: set[str] = {
     "appendix", "appendices",
     "abbreviations", "list of abbreviations",
     "declarations",
+    # Post-abstract metadata sections (appear after Abstract in some PDFs)
+    "addresses", "address", "affiliations", "affiliation",
+    "author affiliations", "author information",
+    "correspondence", "corresponding author",
+    "keywords", "key words", "key-words", "keyword",
+    "article info", "article information",
+    "graphical abstract", "highlights",
+    "sciencedirect",
 }
 
 # Patterns that indicate a header is NOT a paper title
@@ -176,11 +184,13 @@ _AUTHOR_REJECT_PATTERNS: list[str] = [
     r"©|copyright|\bcopyright\b",
     r"\bvol\b\.?\s*\d",
     r"\bpp?\.\s*\d",
+    r"\d+\s*:\s*\d+[-–]\d+",  # volume:page-page (e.g. "22:129-46")
     r"\bissn\b",
     r"\belsevier\b|\bspringer\b|\bwiley\b|\bacademic press\b",
     r"\bthis (article|review|paper)\b",
     r"\bedited by\b",
     r"\brefer\b",
+    r"\bannu\.?\s*rev\b",  # journal abbreviation "Annu. Rev."
     r"^\d+\s*(department|school|university|institute)",
 ]
 
@@ -212,9 +222,11 @@ class SectionClassifier:
     def _normalize(text: str) -> str:
         """Normalize header text: strip numbering, lowercase, trim."""
         text = text.strip().lower()
-        # Remove leading section numbers: "3.", "3.1.", "III.", "A.", "1)"
+        # Remove leading section numbers: "3.", "3.1.", "III.", "a)", "A."
+        # Delimiters (. or )) are REQUIRED for letter prefixes to avoid
+        # stripping the first character of content words.
         text = re.sub(
-            r"^(?:\d+\.?\d*\.?\s*|[ivxlc]+\.?\s*|[a-z]\)?\s*)",
+            r"^(?:\d+\.?\d*\.?\s*|[a-z]{1,4}[\.\)]\s*)",
             "",
             text,
             flags=re.IGNORECASE,
@@ -388,7 +400,9 @@ class MetadataExtractor:
                 title_candidates, preamble_texts
             )
 
-        metadata.authors = MetadataExtractor._extract_authors(preamble_texts)
+        metadata.authors = MetadataExtractor._extract_authors(
+            preamble_texts, metadata.title
+        )
         metadata.year = MetadataExtractor._extract_year(preamble_texts)
 
         return metadata, remaining
@@ -422,10 +436,15 @@ class MetadataExtractor:
         if preamble_texts:
             for text in preamble_texts:
                 text = text.strip()
+                lower = text.lower()
                 if (
                     20 <= len(text) <= 250
                     and not text.endswith(".")
                     and ". " not in text[:80]
+                    and not re.search(
+                        r"\b(published|received|accepted|"
+                        r"copyright|©|doi|https?://)\b", lower
+                    )
                 ):
                     return text
         # Last resort: longest candidate
@@ -440,16 +459,21 @@ class MetadataExtractor:
         return ""
 
     @staticmethod
-    def _extract_authors(texts: list[str]) -> str:
+    def _extract_authors(texts: list[str], title: str = "") -> str:
         """Extract author names from preamble texts.
 
-        Rejects texts matching negative patterns (dates, DOIs, copyright),
-        then scores candidates by author-like features.
+        Rejects texts matching negative patterns (dates, DOIs, copyright)
+        and text identical to the already-extracted title, then scores
+        candidates by author-like features.
         """
+        title_lower = title.strip().lower() if title else ""
         candidates = []
         for text in texts:
             text_stripped = text.strip()
             if not text_stripped or len(text_stripped) > 500:
+                continue
+            # Skip text that matches the title
+            if title_lower and text_stripped.lower() == title_lower:
                 continue
             # Skip full sentences (likely abstract)
             if ". " in text_stripped and len(text_stripped) > 150:
@@ -791,8 +815,19 @@ class PaperConverter:
                     ref_count += 1
                 continue
 
-            # Skip boilerplate sections
+            # Skip boilerplate sections (but mine for year if still missing)
             if current_zone == Zone.SKIP:
+                if (
+                    not metadata.year
+                    and hasattr(item, "text")
+                    and item.text
+                ):
+                    year_match = re.search(
+                        r"\b((?:19|20)\d{2})\b", item.text
+                    )
+                    if year_match:
+                        metadata.year = year_match.group(1)
+                        parts[0] = self._render_metadata(metadata)
                 continue
 
             rendered = renderer.render_item(item, level, current_zone)
