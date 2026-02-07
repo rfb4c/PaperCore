@@ -147,6 +147,14 @@ _BOILERPLATE_HEADERS: set[str] = {
     "appendix", "appendices",
     "abbreviations", "list of abbreviations",
     "declarations",
+    # Post-abstract metadata sections (appear after Abstract in some PDFs)
+    "addresses", "address", "affiliations", "affiliation",
+    "author affiliations", "author information",
+    "correspondence", "corresponding author",
+    "keywords", "key words", "key-words", "keyword",
+    "article info", "article information",
+    "graphical abstract", "highlights",
+    "sciencedirect",
 }
 
 # Patterns that indicate a header is NOT a paper title
@@ -390,7 +398,9 @@ class MetadataExtractor:
                 title_candidates, preamble_texts
             )
 
-        metadata.authors = MetadataExtractor._extract_authors(preamble_texts)
+        metadata.authors = MetadataExtractor._extract_authors(
+            preamble_texts, metadata.title
+        )
         metadata.year = MetadataExtractor._extract_year(preamble_texts)
 
         return metadata, remaining
@@ -447,16 +457,21 @@ class MetadataExtractor:
         return ""
 
     @staticmethod
-    def _extract_authors(texts: list[str]) -> str:
+    def _extract_authors(texts: list[str], title: str = "") -> str:
         """Extract author names from preamble texts.
 
-        Rejects texts matching negative patterns (dates, DOIs, copyright),
-        then scores candidates by author-like features.
+        Rejects texts matching negative patterns (dates, DOIs, copyright)
+        and text identical to the already-extracted title, then scores
+        candidates by author-like features.
         """
+        title_lower = title.strip().lower() if title else ""
         candidates = []
         for text in texts:
             text_stripped = text.strip()
             if not text_stripped or len(text_stripped) > 500:
+                continue
+            # Skip text that matches the title
+            if title_lower and text_stripped.lower() == title_lower:
                 continue
             # Skip full sentences (likely abstract)
             if ". " in text_stripped and len(text_stripped) > 150:
@@ -798,8 +813,19 @@ class PaperConverter:
                     ref_count += 1
                 continue
 
-            # Skip boilerplate sections
+            # Skip boilerplate sections (but mine for year if still missing)
             if current_zone == Zone.SKIP:
+                if (
+                    not metadata.year
+                    and hasattr(item, "text")
+                    and item.text
+                ):
+                    year_match = re.search(
+                        r"\b((?:19|20)\d{2})\b", item.text
+                    )
+                    if year_match:
+                        metadata.year = year_match.group(1)
+                        parts[0] = self._render_metadata(metadata)
                 continue
 
             rendered = renderer.render_item(item, level, current_zone)
